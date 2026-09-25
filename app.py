@@ -144,6 +144,21 @@ class PreservationStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS preservation_proofs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    proof_no INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('valid','invalid')),
+                    trigger TEXT NOT NULL CHECK(trigger IN ('copy.create','copy.verify','format.migrate')),
+                    total_copies INTEGER NOT NULL,
+                    healthy_copies INTEGER NOT NULL,
+                    corrupt_copies INTEGER NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    verified_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(version_id,proof_no)
+                );
                 """
             )
 
@@ -187,6 +202,162 @@ class PreservationStore:
             "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
             (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
+
+    def _proof_payload(self, row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "version_id": row["version_id"],
+            "proof_no": row["proof_no"],
+            "status": row["status"],
+            "trigger": row["trigger"],
+            "total_copies": row["total_copies"],
+            "healthy_copies": row["healthy_copies"],
+            "corrupt_copies": row["corrupt_copies"],
+            "verified_at": row["verified_at"],
+            "created_at": row["created_at"],
+            "created_by": row["created_by"],
+            "detail": json.loads(row["detail"]),
+        }
+
+    def _issue_proof(self, conn, version_id: int, actor_id: str, trigger: str) -> dict:
+        """按该版本全部副本重新核验并出具一份新的当前保全证明。
+
+        旧证明不改动，仍可通过证明历史查询；调用方需已开启事务。
+        """
+        version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
+        if not version:
+            raise BusinessError("档案版本不存在", 404, "not_found")
+        checked_at = now()
+        expected_rows = conn.execute(
+            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (version_id,)
+        ).fetchall()
+        expected = {r["path"]: r for r in expected_rows}
+        copies = conn.execute("SELECT * FROM copies WHERE version_id=? ORDER BY id", (version_id,)).fetchall()
+        copy_reports, healthy, corrupt = [], 0, 0
+        for copy in copies:
+            stored = {
+                r["path"]: r
+                for r in conn.execute(
+                    "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy["id"],)
+                ).fetchall()
+            }
+            reasons = []
+            missing = sorted(set(expected) - set(stored))
+            extra = sorted(set(stored) - set(expected))
+            if missing:
+                reasons.append("缺少文件: " + ",".join(missing))
+            if extra:
+                reasons.append("存在清单外文件: " + ",".join(extra))
+            bad_hash = sorted(
+                p for p in expected.keys() & stored.keys()
+                if hashlib.sha256(stored[p]["content"]).hexdigest() != expected[p]["sha256"]
+                or len(stored[p]["content"]) != expected[p]["size"]
+            )
+            if bad_hash:
+                reasons.append("哈希或大小不匹配: " + ",".join(bad_hash))
+            is_healthy = not reasons
+            if is_healthy:
+                healthy += 1
+                state = "healthy"
+            else:
+                corrupt += 1
+                state = "corrupt"
+            conn.execute(
+                "UPDATE copies SET state=?,last_verified_at=? WHERE id=?", (state, checked_at, copy["id"])
+            )
+            copy_reports.append(
+                {"copy_id": copy["id"], "location": copy["location"], "state": state, "failure_reasons": reasons}
+            )
+        total = len(copies)
+        failure_reasons: list[str] = []
+        if total == 0:
+            status = "invalid"
+            failure_reasons.append("该版本尚无任何离线副本，无保全来源")
+        elif healthy == 0:
+            status = "invalid"
+            failure_reasons.append("所有副本均损坏，没有可用于修复的健康来源")
+        else:
+            status = "valid"
+            if corrupt:
+                bad_locations = [r["location"] for r in copy_reports if r["state"] != "healthy"]
+                failure_reasons.append(
+                    f"{corrupt} 个副本损坏（{', '.join(bad_locations)}），仍有 {healthy} 个健康副本可用于修复"
+                )
+        conn.execute(
+            "UPDATE archive_versions SET state=? WHERE id=?",
+            ("degraded" if healthy == 0 else "verified", version_id),
+        )
+        proof_no = conn.execute(
+            "SELECT COALESCE(MAX(proof_no),0)+1 FROM preservation_proofs WHERE version_id=?", (version_id,)
+        ).fetchone()[0]
+        detail = {
+            "version": version["version"],
+            "failure_reasons": failure_reasons,
+            "copies": copy_reports,
+            "files": [{"path": r["path"], "sha256": r["sha256"], "size": r["size"]} for r in expected_rows],
+        }
+        cur = conn.execute(
+            """INSERT INTO preservation_proofs(version_id,proof_no,status,trigger,total_copies,healthy_copies,
+               corrupt_copies,detail,created_by,verified_at,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (version_id, proof_no, status, trigger, total, healthy, corrupt,
+             json.dumps(detail, ensure_ascii=False, sort_keys=True), actor_id, checked_at, now()),
+        )
+        proof_id = cur.lastrowid
+        detail["proof_id"] = proof_id
+        self._audit(
+            conn, version["archive_id"], actor_id, "proof.issue",
+            {"proof_id": proof_id, "version_id": version_id, "proof_no": proof_no, "status": status,
+             "total_copies": total, "healthy_copies": healthy, "corrupt_copies": corrupt,
+             "failure_reasons": failure_reasons, "trigger": trigger, "verified_at": checked_at},
+        )
+        row = conn.execute("SELECT * FROM preservation_proofs WHERE id=?", (proof_id,)).fetchone()
+        return self._proof_payload(row)
+
+    def current_proof(self, user_id: str, version_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise BusinessError("档案版本不存在", 404, "not_found")
+            self._access(conn, version["archive_id"], user)
+            row = conn.execute(
+                "SELECT * FROM preservation_proofs WHERE version_id=? ORDER BY proof_no DESC LIMIT 1",
+                (version_id,),
+            ).fetchone()
+            if not row:
+                raise BusinessError("该版本尚无保全证明", 404, "proof_missing")
+            return self._proof_payload(row)
+
+    def proof_history(self, user_id: str, version_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise BusinessError("档案版本不存在", 404, "not_found")
+            self._access(conn, version["archive_id"], user)
+            rows = conn.execute(
+                "SELECT * FROM preservation_proofs WHERE version_id=? ORDER BY proof_no DESC", (version_id,)
+            ).fetchall()
+            return {"version_id": version_id, "proofs": [self._proof_payload(r) for r in rows]}
+
+    def archive_proofs(self, user_id: str, archive_id: int) -> dict:
+        """列出档案内每个版本当前生效的保全证明。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            self._access(conn, archive_id, user)
+            versions = conn.execute(
+                "SELECT id,version FROM archive_versions WHERE archive_id=? ORDER BY version", (archive_id,)
+            ).fetchall()
+            current = []
+            for v in versions:
+                row = conn.execute(
+                    "SELECT * FROM preservation_proofs WHERE version_id=? ORDER BY proof_no DESC LIMIT 1",
+                    (v["id"],),
+                ).fetchone()
+                current.append({"version_id": v["id"], "version": v["version"],
+                                "proof": self._proof_payload(row) if row else None})
+            return {"archive_id": archive_id, "current_proofs": current}
 
     def create_archive(self, user_id: str, name: str, retention_until: str, restricted: bool = True) -> dict:
         name = name.strip()
@@ -286,7 +457,10 @@ class PreservationStore:
                     (copy_id, version_id),
                 )
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
-                return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
+                proof = self._issue_proof(conn, version_id, actor_id, "copy.create")
+                return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy",
+                        "proof": {"id": proof["id"], "status": proof["status"],
+                                  "healthy_copies": proof["healthy_copies"], "total_copies": proof["total_copies"]}}
             except sqlite3.IntegrityError:
                 conn.rollback()
                 raise BusinessError("该版本的副本位置已存在", 409, "copy_exists")
@@ -308,7 +482,12 @@ class PreservationStore:
                 "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
             ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            proof_row = conn.execute(
+                "SELECT * FROM preservation_proofs WHERE version_id=? ORDER BY proof_no DESC LIMIT 1", (version_id,)
+            ).fetchone()
+            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files],
+                    "copies": [dict(x) for x in copies],
+                    "current_proof": self._proof_payload(proof_row) if proof_row else None}
 
     def verify_copy(self, user_id: str, copy_id: int) -> dict:
         with self.connect() as conn:
@@ -320,47 +499,63 @@ class PreservationStore:
                     raise BusinessError("副本不存在", 404, "not_found")
                 version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
                 self._access(conn, version["archive_id"], user)
-                stored = conn.execute(
+                stored_rows = conn.execute(
                     "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
                 ).fetchall()
-                corrupt_paths = [r["path"] for r in stored if hashlib.sha256(r["content"]).hexdigest() != r["sha256"] or len(r["content"]) != r["size"]]
+                stored_paths = {r["path"] for r in stored_rows}
+                expected = {
+                    r["path"]: r
+                    for r in conn.execute(
+                        "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
+                    ).fetchall()
+                }
+                corrupt_paths = sorted(
+                    {r["path"] for r in stored_rows
+                     if r["path"] not in expected
+                     or hashlib.sha256(r["content"]).hexdigest() != expected[r["path"]]["sha256"]
+                     or len(r["content"]) != expected[r["path"]]["size"]}
+                    | (set(expected) - stored_paths)
+                )
                 repaired = False
-                if not corrupt_paths:
-                    conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
-                    result_state = "healthy"
-                else:
-                    conn.execute("UPDATE copies SET state='corrupt',last_verified_at=? WHERE id=?", (now(), copy_id))
-                    healthy = conn.execute(
-                        "SELECT id FROM copies WHERE version_id=? AND id<>? AND state='healthy' ORDER BY last_verified_at DESC LIMIT 1",
+                if corrupt_paths:
+                    # 健康来源 = 内容与版本清单完全一致的其他副本；逐个校验，找到才修复。
+                    candidates = conn.execute(
+                        "SELECT id FROM copies WHERE version_id=? AND id<>? ORDER BY id",
                         (copy["version_id"], copy_id),
-                    ).fetchone()
-                    result_state = "degraded"
-                    if healthy:
-                        donor = conn.execute(
-                            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (healthy["id"],)
+                    ).fetchall()
+                    for candidate in candidates:
+                        donor_rows = conn.execute(
+                            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path",
+                            (candidate["id"],),
                         ).fetchall()
-                        donor_by_path = {r["path"]: r for r in donor}
-                        expected = {r["path"]: r for r in conn.execute(
-                            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
-                        ).fetchall()}
+                        donor_by_path = {r["path"]: r for r in donor_rows}
                         if set(donor_by_path) == set(expected) and all(
-                            hashlib.sha256(donor_by_path[p]["content"]).hexdigest() == expected[p]["sha256"] for p in expected
+                            hashlib.sha256(donor_by_path[p]["content"]).hexdigest() == expected[p]["sha256"]
+                            and len(donor_by_path[p]["content"]) == expected[p]["size"]
+                            for p in expected
                         ):
                             conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
                             conn.execute(
                                 """INSERT INTO copy_files(copy_id,path,sha256,size,content)
                                    SELECT ?,path,sha256,size,content FROM copy_files WHERE copy_id=?""",
-                                (copy_id, healthy["id"]),
+                                (copy_id, candidate["id"]),
                             )
-                            conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
-                            repaired, result_state = True, "healthy"
-                    if result_state == "degraded":
-                        conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                            repaired = True
+                            break
+                proof = self._issue_proof(conn, copy["version_id"], user_id, "copy.verify")
+                report = next(c for c in proof["detail"]["copies"] if c["copy_id"] == copy_id)
+                result_state = report["state"]
                 self._audit(
                     conn, version["archive_id"], user_id, "copy.verify",
-                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
+                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths,
+                     "repaired": repaired, "proof_id": proof["id"], "proof_status": proof["status"]},
                 )
-                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired}
+                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths,
+                        "repaired": repaired,
+                        "proof": {"id": proof["id"], "status": proof["status"],
+                                  "healthy_copies": proof["healthy_copies"],
+                                  "total_copies": proof["total_copies"],
+                                  "failure_reasons": proof["detail"]["failure_reasons"]}}
             except Exception:
                 conn.rollback()
                 raise
@@ -425,7 +620,12 @@ class PreservationStore:
                     {"source_version_id": version_id, "target_version_id": target_version_id,
                      "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
                 )
-                return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
+                proof = self._issue_proof(conn, target_version_id, actor_id, "format.migrate")
+                return {"id": target_version_id, "version": version_no, "source_version_id": version_id,
+                        "target_path": converted["path"],
+                        "proof": {"id": proof["id"], "status": proof["status"],
+                                  "healthy_copies": proof["healthy_copies"], "total_copies": proof["total_copies"],
+                                  "failure_reasons": proof["detail"]["failure_reasons"]}}
             except Exception:
                 conn.rollback()
                 raise
@@ -499,8 +699,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, store.grant(user, archive_id, d.get("user_id", ""), d.get("permission", "")))
         if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "status" and method == "GET":
             return self._send(200, store.archive_status(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "proofs" and method == "GET":
+            return self._send(200, store.archive_proofs(user, int(parts[2])))
         if len(parts) == 3 and parts[:2] == ["api", "versions"] and method == "GET":
             return self._send(200, store.get_version(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "proof" and method == "GET":
+            return self._send(200, store.current_proof(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "proofs" and method == "GET":
+            return self._send(200, store.proof_history(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "copies" and method == "POST":
             d = self._body()
             return self._send(201, store.add_copy(user, int(parts[2]), d.get("location", "")))
