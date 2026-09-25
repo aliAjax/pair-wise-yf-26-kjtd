@@ -136,6 +136,17 @@ class PreservationStore:
                     actor_id TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS preservation_proofs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    healthy_copies INTEGER NOT NULL,
+                    total_copies INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('valid','invalid')),
+                    invalid_reason TEXT,
+                    action TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     archive_id INTEGER NOT NULL REFERENCES archives(id),
@@ -187,6 +198,22 @@ class PreservationStore:
             "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
             (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
+
+    def _issue_proof(self, conn, archive_id: int, version_id: int, action: str, invalid_reason: str | None = None) -> dict:
+        """按版本全部副本出具一份新的保全证明；证明只增不改，旧证明保留可查。"""
+        copies = conn.execute("SELECT state FROM copies WHERE version_id=?", (version_id,)).fetchall()
+        healthy = sum(1 for c in copies if c["state"] == "healthy")
+        version_no = conn.execute("SELECT version FROM archive_versions WHERE id=?", (version_id,)).fetchone()["version"]
+        created = now()
+        status = "invalid" if invalid_reason else "valid"
+        cur = conn.execute(
+            """INSERT INTO preservation_proofs(archive_id,version_id,healthy_copies,total_copies,status,invalid_reason,action,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (archive_id, version_id, healthy, len(copies), status, invalid_reason, action, created),
+        )
+        return {"id": cur.lastrowid, "archive_id": archive_id, "version_id": version_id, "version": version_no,
+                "healthy_copies": healthy, "total_copies": len(copies), "status": status,
+                "invalid_reason": invalid_reason, "action": action, "created_at": created}
 
     def create_archive(self, user_id: str, name: str, retention_until: str, restricted: bool = True) -> dict:
         name = name.strip()
@@ -286,7 +313,8 @@ class PreservationStore:
                     (copy_id, version_id),
                 )
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
-                return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
+                proof = self._issue_proof(conn, version["archive_id"], version_id, "copy.create")
+                return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy", "proof": proof}
             except sqlite3.IntegrityError:
                 conn.rollback()
                 raise BusinessError("该版本的副本位置已存在", 409, "copy_exists")
@@ -356,11 +384,15 @@ class PreservationStore:
                             repaired, result_state = True, "healthy"
                     if result_state == "degraded":
                         conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                invalid_reason = None
+                if result_state == "degraded":
+                    invalid_reason = f"副本 {copy_id} 有 {len(corrupt_paths)} 个文件损坏且无健康副本可修复"
+                proof = self._issue_proof(conn, version["archive_id"], copy["version_id"], "copy.verify", invalid_reason)
                 self._audit(
                     conn, version["archive_id"], user_id, "copy.verify",
                     {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
                 )
-                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired}
+                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired, "proof": proof}
             except Exception:
                 conn.rollback()
                 raise
@@ -425,7 +457,8 @@ class PreservationStore:
                     {"source_version_id": version_id, "target_version_id": target_version_id,
                      "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
                 )
-                return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
+                proof = self._issue_proof(conn, source_version["archive_id"], target_version_id, "format.migrate")
+                return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"], "proof": proof}
             except Exception:
                 conn.rollback()
                 raise
@@ -445,6 +478,35 @@ class PreservationStore:
                              for v in versions],
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
+
+    def archive_proof(self, user_id: str, archive_id: int) -> dict:
+        """档案各版本的当前保全证明（每个版本最新一份）。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            self._access(conn, archive_id, user)
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            rows = conn.execute(
+                """SELECT p.*, v.version FROM preservation_proofs p
+                   JOIN archive_versions v ON v.id=p.version_id
+                   WHERE p.id IN (SELECT MAX(id) FROM preservation_proofs WHERE archive_id=? GROUP BY version_id)
+                   ORDER BY v.version""",
+                (archive_id,),
+            ).fetchall()
+            return {"archive": dict(archive), "proofs": [dict(r) for r in rows]}
+
+    def archive_proof_history(self, user_id: str, archive_id: int) -> dict:
+        """档案全部历史保全证明（含已失效证明），最新在前。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            self._access(conn, archive_id, user)
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            rows = conn.execute(
+                """SELECT p.*, v.version FROM preservation_proofs p
+                   JOIN archive_versions v ON v.id=p.version_id
+                   WHERE p.archive_id=? ORDER BY p.id DESC""",
+                (archive_id,),
+            ).fetchall()
+            return {"archive": dict(archive), "proofs": [dict(r) for r in rows]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -499,6 +561,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, store.grant(user, archive_id, d.get("user_id", ""), d.get("permission", "")))
         if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "status" and method == "GET":
             return self._send(200, store.archive_status(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "proof" and method == "GET":
+            return self._send(200, store.archive_proof(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "proofs" and method == "GET":
+            return self._send(200, store.archive_proof_history(user, int(parts[2])))
         if len(parts) == 3 and parts[:2] == ["api", "versions"] and method == "GET":
             return self._send(200, store.get_version(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "copies" and method == "POST":
